@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -15,14 +16,15 @@ import (
 )
 
 var (
-	natsURL          = "http://localhost:4222"
-	streamName       = "ORDERS"
-	streamSubject    = "ORDERS.*"
-	durableName      = "durable-name"
-	queueGroupName   = "MONITOR.ORDERS"
-	consumerName     = "durable-name"
-	subscribeSubject = "ORDERS.queue-group"
-	sendMessageRange = "1..5"
+	natsURL             = "http://localhost:4222"
+	streamName          = "ORDERS"
+	streamSubject       = "ORDERS.*"
+	durableName         = "MONITOR_ORDERS_durable_auto"
+	queueGroupName      = "MONITOR.ORDERS.durable.auto"
+	consumerName        = durableName
+	subjectName         = "ORDERS.queue-group"
+	sendMessageRange    = "1..5"
+	deliverPolicyString = "last"
 )
 
 type message struct {
@@ -39,7 +41,7 @@ func main() {
 		),
 		zap.Development(),
 		zap.ErrorOutput(zapcore.AddSync(io.Writer(os.Stderr))),
-	)
+	).With(zap.Int("pid", os.Getpid()))
 
 	flag.StringVar(&natsURL, "url", natsURL, "NATS url")
 	flag.StringVar(&streamName, "stream", streamName, "NATS stream name")
@@ -47,15 +49,17 @@ func main() {
 	flag.StringVar(&durableName, "durable", durableName, "NATS durable name")
 	flag.StringVar(&queueGroupName, "queue", queueGroupName, "NATS queue name")
 	flag.StringVar(&consumerName, "consumer", consumerName, "NATS consumer name")
-	flag.StringVar(&subscribeSubject, "subscription", subscribeSubject, "NATS subscription subject name")
+	flag.StringVar(&subjectName, "subscription", subjectName, "NATS subscription subject name")
 	flag.StringVar(&sendMessageRange, "range", sendMessageRange, "Messages IDs range")
+	flag.StringVar(&deliverPolicyString, "deliver-policy", consumerName, "NATS deliver policy [all,last,new]")
 	flag.Parse()
 
-	logger.Debug("init", zap.String("sendMessageRange", sendMessageRange))
+	logger.Debug("init", zap.String("sendMessageRange", sendMessageRange), zap.String("deliver-policy", deliverPolicyString))
 	messageIDsBoundary := strings.Split(sendMessageRange, "..")
 	if len(messageIDsBoundary) != 2 {
 		logger.Fatal("failed to parse range: must be x..y")
 	}
+	deliverPolicy, deliverPolicyOpt := deliverPolicyFromString(deliverPolicyString)
 	messageIDsFrom, err := strconv.ParseInt(messageIDsBoundary[0], 10, 64)
 	messageIDsTo, err := strconv.ParseInt(messageIDsBoundary[1], 10, 64)
 
@@ -102,7 +106,7 @@ func main() {
 			AckWait:        5 * time.Second,
 			DeliverSubject: queueGroupName,
 			DeliverGroup:   queueGroupName,
-			DeliverPolicy:  nats.DeliverNewPolicy,
+			DeliverPolicy:  deliverPolicy,
 		})
 		if err != nil {
 			logger.Fatal("failed to add consumer",
@@ -114,7 +118,12 @@ func main() {
 			logger.Info("consumer added", zap.Any("consumer", ci), zap.Error(err))
 		}
 	}
-	_, err = js.QueueSubscribe(subscribeSubject, queueGroupName, func(m *nats.Msg) {
+	wantCount := messageIDsTo - messageIDsFrom
+	var processed int64
+	done := make(chan struct{})
+	catched := make(chan struct{})
+	defer close(done)
+	_, err = js.QueueSubscribe(subjectName, queueGroupName, func(m *nats.Msg) {
 		var msg message
 		if err := json.Unmarshal(m.Data, &msg); err != nil {
 			logger.Error("failed to unmarshal message", zap.ByteString("raw", m.Data), zap.Error(err))
@@ -124,17 +133,21 @@ func main() {
 			logger.Error("failed to send ack", zap.Any("message", msg), zap.Error(err))
 			return
 		}
+		if atomic.AddInt64(&processed, 1) > wantCount {
+			done <- struct{}{}
+		}
+		catched <- struct{}{}
 		logger.Info("msg ack", zap.Any("message", msg))
 	},
 		nats.ManualAck(),
 		nats.Durable(ci.Config.Durable),
 		nats.AckWait(ci.Config.AckWait),
 		nats.DeliverSubject(ci.Config.DeliverSubject),
-		nats.DeliverNew(),
+		deliverPolicyOpt,
 	)
 	if err != nil {
 		logger.Fatal("failed to subscribe",
-			zap.String("subject name", subscribeSubject),
+			zap.String("subject name", subjectName),
 			zap.String("queue name", queueGroupName),
 			zap.Error(err),
 		)
@@ -148,14 +161,49 @@ func main() {
 		if err != nil {
 			logger.Fatal("failed to marshal message", zap.Any("message", msg), zap.Error(err))
 		}
-		_, err = js.Publish(streamSubject, b)
+		_, err = js.Publish(subjectName, b)
 		if err != nil {
 			logger.Fatal("failed to publish message",
-				zap.String("stream subject", streamSubject),
+				zap.String("subject name", subjectName),
 				zap.Any("message", msg),
 				zap.Error(err),
 			)
 		}
-		logger.Info("message published", zap.String("stream subject", streamSubject), zap.Any("message", msg))
+		logger.Info("message published", zap.String("subject name", subjectName), zap.Any("message", msg))
+	}
+
+	timeout := 5 * time.Second
+	ticker := time.NewTicker(timeout)
+
+LOOP:
+	for {
+		select {
+		case <-ticker.C:
+			logger.Fatal("===== TIMED OUT =====",
+				zap.Int64("sended", wantCount),
+				zap.Int64("processed", processed),
+			)
+		case <-done:
+			logger.Info("===== DONE =====",
+				zap.Int64("sended", wantCount),
+				zap.Int64("processed", processed),
+			)
+			break LOOP
+		case <-catched:
+			ticker.Reset(timeout)
+		}
+	}
+}
+
+func deliverPolicyFromString(s string) (nats.DeliverPolicy, nats.SubOpt) {
+	switch strings.ToLower(s) {
+	case "all":
+		return nats.DeliverAllPolicy, nats.DeliverAll()
+	case "new":
+		return nats.DeliverNewPolicy, nats.DeliverNew()
+	case "last":
+		fallthrough
+	default:
+		return nats.DeliverLastPolicy, nats.DeliverLast()
 	}
 }
