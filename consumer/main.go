@@ -5,9 +5,7 @@ import (
 	"flag"
 	"io"
 	"os"
-	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -25,6 +23,7 @@ var (
 	subjectName         = "ORDERS.queue-group"
 	sendMessageRange    = "1..5"
 	deliverPolicyString = "last"
+	closeTimeout        = 5 * time.Second
 )
 
 type message struct {
@@ -50,17 +49,11 @@ func main() {
 	flag.StringVar(&queueGroupName, "queue", queueGroupName, "NATS queue name")
 	flag.StringVar(&consumerName, "consumer", consumerName, "NATS consumer name")
 	flag.StringVar(&subjectName, "subscription", subjectName, "NATS subscription subject name")
-	flag.StringVar(&sendMessageRange, "range", sendMessageRange, "Messages IDs range")
 	flag.StringVar(&deliverPolicyString, "deliver-policy", deliverPolicyString, "NATS deliver policy [all,last,new]")
+	flag.DurationVar(&closeTimeout, "close-timeout", closeTimeout, "Timeout to drain NATS subscription and close NATS connection without work")
 	flag.Parse()
 
-	messageIDsBoundary := strings.Split(sendMessageRange, "..")
-	if len(messageIDsBoundary) != 2 {
-		logger.Fatal("failed to parse range: must be x..y")
-	}
 	deliverPolicy, deliverPolicyOpt := deliverPolicyFromString(deliverPolicyString)
-	messageIDsFrom, err := strconv.ParseInt(messageIDsBoundary[0], 10, 64)
-	messageIDsTo, err := strconv.ParseInt(messageIDsBoundary[1], 10, 64)
 
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
@@ -117,11 +110,9 @@ func main() {
 			logger.Info("consumer added", zap.Any("consumer", ci), zap.Error(err))
 		}
 	}
-	wantCount := messageIDsTo - messageIDsFrom
 	var processed int64
-	done := make(chan struct{})
 	catched := make(chan struct{})
-	defer close(done)
+	defer close(catched)
 	sub, err := js.QueueSubscribe(subjectName, queueGroupName, func(m *nats.Msg) {
 		var msg message
 		if err := json.Unmarshal(m.Data, &msg); err != nil {
@@ -131,9 +122,6 @@ func main() {
 		if err := m.Ack(); err != nil {
 			logger.Error("failed to send ack", zap.Any("message", msg), zap.Error(err))
 			return
-		}
-		if atomic.AddInt64(&processed, 1) > wantCount {
-			done <- struct{}{}
 		}
 		catched <- struct{}{}
 		logger.Info("msg ack", zap.Any("message", msg))
@@ -151,42 +139,15 @@ func main() {
 			zap.Error(err),
 		)
 	}
-	for i := messageIDsFrom; i <= messageIDsTo; i++ {
-		msg := &message{
-			ID:        int(i),
-			Timestamp: time.Now(),
-		}
-		b, err := json.Marshal(msg)
-		if err != nil {
-			logger.Fatal("failed to marshal message", zap.Any("message", msg), zap.Error(err))
-		}
-		_, err = js.Publish(subjectName, b)
-		if err != nil {
-			logger.Fatal("failed to publish message",
-				zap.String("subject name", subjectName),
-				zap.Any("message", msg),
-				zap.Error(err),
-			)
-		}
-		logger.Info("message published", zap.String("subject name", subjectName), zap.Any("message", msg))
-	}
 
-	timeout := 5 * time.Second
+	timeout := closeTimeout
 	ticker := time.NewTicker(timeout)
 
 LOOP:
 	for {
 		select {
 		case <-ticker.C:
-			logger.Fatal("===== TIMED OUT =====",
-				zap.Int64("sended", wantCount),
-				zap.Int64("processed", processed),
-			)
-		case <-done:
-			logger.Info("===== DONE =====",
-				zap.Int64("sended", wantCount),
-				zap.Int64("processed", processed),
-			)
+			logger.Info("===== TIMED OUT =====", zap.Int64("processed", processed))
 			break LOOP
 		case <-catched:
 			ticker.Reset(timeout)
