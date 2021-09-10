@@ -123,7 +123,7 @@ func main() {
 	done := make(chan struct{})
 	catched := make(chan struct{})
 	defer close(done)
-	_, err = js.QueueSubscribe(subjectName, queueGroupName, func(m *nats.Msg) {
+	sub, err := js.QueueSubscribe(subjectName, queueGroupName, func(m *nats.Msg) {
 		var msg message
 		if err := json.Unmarshal(m.Data, &msg); err != nil {
 			logger.Error("failed to unmarshal message", zap.ByteString("raw", m.Data), zap.Error(err))
@@ -193,6 +193,8 @@ LOOP:
 			ticker.Reset(timeout)
 		}
 	}
+	sub.Drain()
+	nc.Drain()
 }
 
 func deliverPolicyFromString(s string) (nats.DeliverPolicy, nats.SubOpt) {
